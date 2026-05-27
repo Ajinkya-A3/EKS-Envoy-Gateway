@@ -1,0 +1,92 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: external-proxy-config
+  namespace: gateway
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+
+      # ── Deployment configuration ──────────────────────────────────────
+      envoyDeployment:
+
+        # Patch the generated Deployment using StrategicMerge.
+        # This targets the shutdown-manager sidecar container specifically
+        # and adds a preStop hook for graceful connection draining.
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              template:
+                spec:
+                  containers:
+                    - name: shutdown-manager
+                      lifecycle:
+                        preStop:
+                          exec:
+                            # Sleep 120s on shutdown.
+                            # NLB deregistration takes up to 60s — this gives
+                            # a full 60s extra buffer for in-flight requests
+                            # to complete before Envoy actually stops.
+                            command: ["/bin/sh", "-c", "sleep 120"]
+
+        # Resource requests and limits for the main envoy container.
+        # shutdown-manager sidecar uses negligible resources (<10m CPU, <32Mi).
+        container:
+          resources:
+            requests:
+              cpu: 250m       # Guaranteed CPU for scheduling
+              memory: 512Mi   # Guaranteed memory for scheduling
+            limits:
+              # No CPU limit — intentional.
+              # CPU throttling causes latency spikes in Envoy.
+              # HPA handles scale-out instead of relying on limits.
+              memory: 1Gi     # Hard ceiling — prevents OOMKill during bursts
+
+      # ── Horizontal Pod Autoscaler ─────────────────────────────────────
+      envoyHpa:
+        # Minimum 1 pod — cost-efficient for low/no traffic periods.
+        # Acceptable if you can tolerate ~30s cold-start when scaling from 0
+        # or brief single-point-of-failure window at 1 pod.
+        # Increase to 2 or 3 if you need HA at all times.
+        minReplicas: 1
+
+        # Maximum 5 pods.
+        # At 250m CPU per pod, 5 pods = 1.25 vCPU total proxy capacity.
+        # Caps cost while handling significant traffic spikes.
+        maxReplicas: 5
+
+        metrics:
+          - type: Resource
+            resource:
+              name: cpu
+              target:
+                type: Utilization
+                # Scale out when average CPU across pods hits 60% of request.
+                # 60% of 250m = 150m actual CPU triggers a new pod.
+                # Conservative enough to scale before latency degrades,
+                # without scaling too aggressively on short spikes.
+                averageUtilization: 60
+
+      # ── NLB Service configuration ─────────────────────────────────────
+      envoyService:
+        annotations:
+          # Stops the in-tree CLB provisioner.
+          # AWS Load Balancer Controller takes over and creates an NLB instead.
+          service.beta.kubernetes.io/aws-load-balancer-type: "external"
+
+          # Creates a public-facing NLB in your public subnets.
+          # Change to "internal" for private/internal traffic only.
+          service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+
+          # Route NLB traffic directly to Pod IPs via VPC CNI.
+          # Lower latency than instance mode — bypasses kube-proxy and NodePort.
+          service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+
+          # NLB health check uses Envoy's built-in admin port (19002).
+          # /healthz returns 200 only when Envoy is fully ready.
+          # This prevents the NLB from sending traffic to starting/draining pods.
+          service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+          service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "19002"
+          service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: "/healthz"
